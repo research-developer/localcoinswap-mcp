@@ -3,6 +3,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { LocalCoinSwapClient } from './api-client.js';
 import { createServer } from './server.js';
+import { startConfirmationCleanup } from './handlers.js';
 import type { ServerConfig } from './types.js';
 
 // Load configuration from environment
@@ -19,10 +20,14 @@ async function main() {
   const client = new LocalCoinSwapClient(config.apiUrl, config.apiToken);
   const server = createServer(config, client);
 
+  // Start periodic cleanup of expired confirmations (every 60 seconds)
+  startConfirmationCleanup(60000);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
   // Log to stderr so it doesn't interfere with MCP protocol
+  // Note: We only log whether the token is configured, never the actual value
   console.error('LocalCoinSwap MCP server started');
   console.error(`API URL: ${config.apiUrl}`);
   console.error(`Confirmation required: ${config.requireConfirmation}`);

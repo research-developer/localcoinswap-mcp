@@ -7,18 +7,47 @@ export interface ToolResponse {
   isError?: boolean;
 }
 
+// Pending confirmation entry with bound parameters
+interface PendingConfirmation {
+  action: 'create_swap' | 'start_trade';
+  params: Record<string, unknown>;
+  expiresAt: number;
+}
+
 // Track pending confirmations for sensitive operations
-const pendingConfirmations = new Map<
-  string,
-  {
-    action: string;
-    params: Record<string, unknown>;
-    expiresAt: number;
-  }
->();
+const pendingConfirmations = new Map<string, PendingConfirmation>();
+
+// Cleanup interval handle
+let cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
 function generateConfirmationId(): string {
   return `confirm_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+}
+
+// Periodic cleanup of expired confirmations to prevent memory leaks
+function cleanupExpiredConfirmations(): void {
+  const now = Date.now();
+  for (const [id, confirmation] of pendingConfirmations) {
+    if (confirmation.expiresAt < now) {
+      pendingConfirmations.delete(id);
+    }
+  }
+}
+
+// Start periodic cleanup (call once at server startup)
+export function startConfirmationCleanup(intervalMs = 60000): void {
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+  }
+  cleanupInterval = setInterval(cleanupExpiredConfirmations, intervalMs);
+}
+
+// Stop cleanup (for testing)
+export function stopConfirmationCleanup(): void {
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+    cleanupInterval = null;
+  }
 }
 
 // Export for testing
@@ -28,6 +57,120 @@ export function clearPendingConfirmations(): void {
 
 export function getPendingConfirmation(id: string) {
   return pendingConfirmations.get(id);
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Reusable API token validation
+function requireApiToken(config: ServerConfig): ToolResponse | null {
+  if (!config.apiToken) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
+        },
+      ],
+      isError: true,
+    };
+  }
+  return null;
+}
+
+// Currency symbol validation
+const CURRENCY_SYMBOL_REGEX = /^[A-Z0-9]{2,10}$/;
+
+function validateCurrencySymbol(symbol: string): string | null {
+  const normalized = symbol.toUpperCase().trim();
+  if (!CURRENCY_SYMBOL_REGEX.test(normalized)) {
+    return `Invalid currency symbol: "${symbol}". Must be 2-10 alphanumeric characters.`;
+  }
+  return null;
+}
+
+// Amount validation
+function validateAmount(amount: string): string | null {
+  const trimmed = amount.trim();
+  // Check for valid positive decimal number
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) {
+    return `Invalid amount: "${amount}". Must be a positive number.`;
+  }
+  const numValue = parseFloat(trimmed);
+  if (numValue <= 0) {
+    return `Invalid amount: "${amount}". Must be greater than zero.`;
+  }
+  if (!isFinite(numValue)) {
+    return `Invalid amount: "${amount}". Number is not finite.`;
+  }
+  return null;
+}
+
+// Validate confirmation and check parameter binding
+function validateConfirmation(
+  confirmationId: string,
+  expectedAction: 'create_swap' | 'start_trade',
+  expectedParams: Record<string, unknown>
+): ToolResponse | null {
+  const pending = pendingConfirmations.get(confirmationId);
+
+  if (!pending) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'Error: Invalid or expired confirmation ID. Please start a new request.',
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  if (pending.expiresAt < Date.now()) {
+    pendingConfirmations.delete(confirmationId);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'Error: Confirmation ID has expired. Please start a new request.',
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Verify action type matches
+  if (pending.action !== expectedAction) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: Confirmation ID was issued for a different action (${pending.action}). Please start a new request.`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Verify parameters match the original request (security: prevent token reuse for different operations)
+  for (const [key, value] of Object.entries(expectedParams)) {
+    if (pending.params[key] !== value) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error: Request parameters do not match the original confirmation. Parameter "${key}" differs. Please start a new request.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Valid - remove from pending
+  pendingConfirmations.delete(confirmationId);
+  return null;
 }
 
 // ============================================================================
@@ -80,6 +223,12 @@ export async function handleGetCurrency(
   params: { symbol: string }
 ): Promise<ToolResponse> {
   try {
+    // Validate input
+    const symbolError = validateCurrencySymbol(params.symbol);
+    if (symbolError) {
+      return { content: [{ type: 'text', text: `Error: ${symbolError}` }], isError: true };
+    }
+
     const currency = await client.getCurrency(params.symbol.toUpperCase());
     return {
       content: [{ type: 'text', text: JSON.stringify(currency, null, 2) }],
@@ -117,6 +266,34 @@ export async function handleSearchOffers(
   }
 ): Promise<ToolResponse> {
   try {
+    // Validate currency symbols if provided
+    if (params.coin_currency) {
+      const error = validateCurrencySymbol(params.coin_currency);
+      if (error) {
+        return { content: [{ type: 'text', text: `Error: ${error}` }], isError: true };
+      }
+    }
+    if (params.fiat_currency) {
+      const error = validateCurrencySymbol(params.fiat_currency);
+      if (error) {
+        return { content: [{ type: 'text', text: `Error: ${error}` }], isError: true };
+      }
+    }
+
+    // Validate amounts if provided
+    if (params.min_amount !== undefined && params.min_amount < 0) {
+      return {
+        content: [{ type: 'text', text: 'Error: min_amount must be non-negative.' }],
+        isError: true,
+      };
+    }
+    if (params.max_amount !== undefined && params.max_amount < 0) {
+      return {
+        content: [{ type: 'text', text: 'Error: max_amount must be non-negative.' }],
+        isError: true,
+      };
+    }
+
     const results = await client.searchOffers({
       coin_currency: params.coin_currency?.toUpperCase(),
       fiat_currency: params.fiat_currency?.toUpperCase(),
@@ -216,19 +393,10 @@ export async function handleGetMyOffers(
   client: LocalCoinSwapClient,
   config: ServerConfig
 ): Promise<ToolResponse> {
-  try {
-    if (!config.apiToken) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
-          },
-        ],
-        isError: true,
-      };
-    }
+  const tokenError = requireApiToken(config);
+  if (tokenError) return tokenError;
 
+  try {
     const results = await client.getMyOffers();
     return {
       content: [{ type: 'text', text: JSON.stringify(results, null, 2) }],
@@ -293,6 +461,20 @@ export async function handleEstimateSwap(
   params: { from_currency: string; to_currency: string; amount: string }
 ): Promise<ToolResponse> {
   try {
+    // Validate inputs
+    const fromError = validateCurrencySymbol(params.from_currency);
+    if (fromError) {
+      return { content: [{ type: 'text', text: `Error: ${fromError}` }], isError: true };
+    }
+    const toError = validateCurrencySymbol(params.to_currency);
+    if (toError) {
+      return { content: [{ type: 'text', text: `Error: ${toError}` }], isError: true };
+    }
+    const amountError = validateAmount(params.amount);
+    if (amountError) {
+      return { content: [{ type: 'text', text: `Error: ${amountError}` }], isError: true };
+    }
+
     const estimate = await client.estimateSwap(
       params.from_currency.toUpperCase(),
       params.to_currency.toUpperCase(),
@@ -334,6 +516,16 @@ export async function handleGetMinSwapAmount(
   params: { from_currency: string; to_currency: string }
 ): Promise<ToolResponse> {
   try {
+    // Validate inputs
+    const fromError = validateCurrencySymbol(params.from_currency);
+    if (fromError) {
+      return { content: [{ type: 'text', text: `Error: ${fromError}` }], isError: true };
+    }
+    const toError = validateCurrencySymbol(params.to_currency);
+    if (toError) {
+      return { content: [{ type: 'text', text: `Error: ${toError}` }], isError: true };
+    }
+
     const minAmount = await client.getMinSwapAmount(
       params.from_currency.toUpperCase(),
       params.to_currency.toUpperCase()
@@ -360,19 +552,10 @@ export async function handleGetMySwaps(
   config: ServerConfig,
   params: { status?: 'active' | 'past' | 'all' }
 ): Promise<ToolResponse> {
-  try {
-    if (!config.apiToken) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
-          },
-        ],
-        isError: true,
-      };
-    }
+  const tokenError = requireApiToken(config);
+  if (tokenError) return tokenError;
 
+  try {
     let swaps;
     switch (params.status) {
       case 'active':
@@ -412,38 +595,45 @@ export async function handleCreateSwap(
     confirmation_id?: string;
   }
 ): Promise<ToolResponse> {
+  const tokenError = requireApiToken(config);
+  if (tokenError) return tokenError;
+
   try {
-    if (!config.apiToken) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
-          },
-        ],
-        isError: true,
-      };
+    // Validate inputs
+    const fromError = validateCurrencySymbol(params.from_currency);
+    if (fromError) {
+      return { content: [{ type: 'text', text: `Error: ${fromError}` }], isError: true };
+    }
+    const toError = validateCurrencySymbol(params.to_currency);
+    if (toError) {
+      return { content: [{ type: 'text', text: `Error: ${toError}` }], isError: true };
+    }
+    const amountError = validateAmount(params.from_amount);
+    if (amountError) {
+      return { content: [{ type: 'text', text: `Error: ${amountError}` }], isError: true };
     }
 
-    // Check if confirmation is required
-    if (config.requireConfirmation && !params.confirm && !params.confirmation_id) {
-      // Generate confirmation ID and store pending action
+    const normalizedParams = {
+      from_currency: params.from_currency.toUpperCase(),
+      to_currency: params.to_currency.toUpperCase(),
+      from_amount: params.from_amount,
+    };
+
+    // Check if confirmation is required (use !== true to properly handle explicit false)
+    if (config.requireConfirmation && params.confirm !== true && !params.confirmation_id) {
+      // Generate confirmation ID and store pending action with bound parameters
       const confirmId = generateConfirmationId();
       pendingConfirmations.set(confirmId, {
         action: 'create_swap',
-        params: {
-          from_currency: params.from_currency.toUpperCase(),
-          to_currency: params.to_currency.toUpperCase(),
-          from_amount: params.from_amount,
-        },
+        params: normalizedParams,
         expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
       });
 
       // Get estimate for display
       const estimate = await client.estimateSwap(
-        params.from_currency.toUpperCase(),
-        params.to_currency.toUpperCase(),
-        params.from_amount
+        normalizedParams.from_currency,
+        normalizedParams.to_currency,
+        normalizedParams.from_amount
       );
 
       return {
@@ -454,12 +644,12 @@ export async function handleCreateSwap(
               {
                 status: 'confirmation_required',
                 message:
-                  'This swap requires confirmation before execution. Call create_swap again with confirm=true or use the confirmation_id.',
+                  'This swap requires confirmation before execution. Call create_swap again with confirm=true or use the confirmation_id with the SAME parameters.',
                 confirmation_id: confirmId,
                 expires_in: '5 minutes',
                 swap_details: {
-                  from: `${params.from_amount} ${params.from_currency.toUpperCase()}`,
-                  to: `${estimate.to_amount} ${params.to_currency.toUpperCase()}`,
+                  from: `${normalizedParams.from_amount} ${normalizedParams.from_currency}`,
+                  to: `${estimate.to_amount} ${normalizedParams.to_currency}`,
                   rate: estimate.rate,
                 },
               },
@@ -471,41 +661,18 @@ export async function handleCreateSwap(
       };
     }
 
-    // Validate confirmation ID if provided
+    // Validate confirmation ID if provided (with parameter binding check)
     if (params.confirmation_id) {
-      const pending = pendingConfirmations.get(params.confirmation_id);
-      if (!pending) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: Invalid or expired confirmation ID. Please start a new swap request.',
-            },
-          ],
-          isError: true,
-        };
-      }
-      if (pending.expiresAt < Date.now()) {
-        pendingConfirmations.delete(params.confirmation_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: Confirmation ID has expired. Please start a new swap request.',
-            },
-          ],
-          isError: true,
-        };
-      }
-      pendingConfirmations.delete(params.confirmation_id);
+      const validationError = validateConfirmation(
+        params.confirmation_id,
+        'create_swap',
+        normalizedParams
+      );
+      if (validationError) return validationError;
     }
 
     // Execute the swap
-    const swap = await client.createSwap({
-      from_currency: params.from_currency.toUpperCase(),
-      to_currency: params.to_currency.toUpperCase(),
-      from_amount: params.from_amount,
-    });
+    const swap = await client.createSwap(normalizedParams);
 
     return {
       content: [
@@ -542,29 +709,31 @@ export async function handleStartTrade(
     confirmation_id?: string;
   }
 ): Promise<ToolResponse> {
+  const tokenError = requireApiToken(config);
+  if (tokenError) return tokenError;
+
   try {
-    if (!config.apiToken) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
-          },
-        ],
-        isError: true,
-      };
+    // Validate amount
+    const amountError = validateAmount(params.amount);
+    if (amountError) {
+      return { content: [{ type: 'text', text: `Error: ${amountError}` }], isError: true };
     }
 
-    // Check if confirmation is required
-    if (config.requireConfirmation && !params.confirm && !params.confirmation_id) {
+    const normalizedParams = {
+      offer_uuid: params.offer_uuid,
+      amount: params.amount,
+    };
+
+    // Check if confirmation is required (use !== true to properly handle explicit false)
+    if (config.requireConfirmation && params.confirm !== true && !params.confirmation_id) {
       // Get offer details for display
       const offer = await client.getOffer(params.offer_uuid);
 
-      // Generate confirmation ID and store pending action
+      // Generate confirmation ID and store pending action with bound parameters
       const confirmId = generateConfirmationId();
       pendingConfirmations.set(confirmId, {
         action: 'start_trade',
-        params: { offer_uuid: params.offer_uuid, amount: params.amount },
+        params: normalizedParams,
         expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
       });
 
@@ -576,7 +745,7 @@ export async function handleStartTrade(
               {
                 status: 'confirmation_required',
                 message:
-                  'This trade requires confirmation before starting. Call start_trade again with confirm=true or use the confirmation_id.',
+                  'This trade requires confirmation before starting. Call start_trade again with confirm=true or use the confirmation_id with the SAME parameters.',
                 confirmation_id: confirmId,
                 expires_in: '5 minutes',
                 trade_details: {
@@ -596,40 +765,18 @@ export async function handleStartTrade(
       };
     }
 
-    // Validate confirmation ID if provided
+    // Validate confirmation ID if provided (with parameter binding check)
     if (params.confirmation_id) {
-      const pending = pendingConfirmations.get(params.confirmation_id);
-      if (!pending) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: Invalid or expired confirmation ID. Please start a new trade request.',
-            },
-          ],
-          isError: true,
-        };
-      }
-      if (pending.expiresAt < Date.now()) {
-        pendingConfirmations.delete(params.confirmation_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: Confirmation ID has expired. Please start a new trade request.',
-            },
-          ],
-          isError: true,
-        };
-      }
-      pendingConfirmations.delete(params.confirmation_id);
+      const validationError = validateConfirmation(
+        params.confirmation_id,
+        'start_trade',
+        normalizedParams
+      );
+      if (validationError) return validationError;
     }
 
     // Execute the trade
-    const trade = await client.startTrade({
-      offer_uuid: params.offer_uuid,
-      amount: params.amount,
-    });
+    const trade = await client.startTrade(normalizedParams);
 
     return {
       content: [
@@ -656,19 +803,10 @@ export async function handleGetMyTrades(
   client: LocalCoinSwapClient,
   config: ServerConfig
 ): Promise<ToolResponse> {
-  try {
-    if (!config.apiToken) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
-          },
-        ],
-        isError: true,
-      };
-    }
+  const tokenError = requireApiToken(config);
+  if (tokenError) return tokenError;
 
+  try {
     const trades = await client.getMyTrades();
     return {
       content: [{ type: 'text', text: JSON.stringify(trades, null, 2) }],
@@ -691,19 +829,10 @@ export async function handleGetTrade(
   config: ServerConfig,
   params: { uuid: string }
 ): Promise<ToolResponse> {
-  try {
-    if (!config.apiToken) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'Error: API token not configured. Set LCS_API_TOKEN environment variable.',
-          },
-        ],
-        isError: true,
-      };
-    }
+  const tokenError = requireApiToken(config);
+  if (tokenError) return tokenError;
 
+  try {
     const trade = await client.getTrade(params.uuid);
     return {
       content: [{ type: 'text', text: JSON.stringify(trade, null, 2) }],

@@ -38,9 +38,9 @@ export function createServer(config: ServerConfig, client: LocalCoinSwapClient):
 
   server.tool(
     'list_currencies',
-    'List all available cryptocurrencies on LocalCoinSwap, including network information (e.g., USDT on TRC20, ERC20, etc.)',
+    'List available currencies on LocalCoinSwap. Use type="crypto" for cryptocurrencies (default), type="fiat" for fiat currencies, or type="active" for actively traded cryptos. Includes network information (e.g., USDT on TRC20, ERC20).',
     {
-      type: z.enum(['crypto', 'fiat', 'active']).optional().describe('Type of currencies to list'),
+      type: z.enum(['crypto', 'fiat', 'active']).optional().describe('Type of currencies to list: crypto (default), fiat, or active'),
     },
     async ({ type }) => {
       try {

@@ -17,6 +17,8 @@ import {
   handleGetTrade,
   clearPendingConfirmations,
   getPendingConfirmation,
+  startConfirmationCleanup,
+  stopConfirmationCleanup,
 } from '../src/handlers.js';
 import { LocalCoinSwapClient } from '../src/api-client.js';
 import type { ServerConfig } from '../src/types.js';
@@ -266,6 +268,153 @@ describe('Tool Handlers', () => {
   });
 });
 
+describe('Input Validation', () => {
+  let mockClient: LocalCoinSwapClient;
+  let config: ServerConfig;
+
+  beforeEach(() => {
+    mockClient = {
+      getCurrency: vi.fn().mockResolvedValue(mockCurrencies[0]),
+      searchOffers: vi.fn().mockResolvedValue(mockPaginatedOffers),
+      estimateSwap: vi.fn().mockResolvedValue(mockSwapEstimate),
+      getMinSwapAmount: vi.fn().mockResolvedValue(mockMinSwapAmount),
+      createSwap: vi.fn().mockResolvedValue(mockSwap),
+      startTrade: vi.fn().mockResolvedValue(mockTrade),
+      getOffer: vi.fn().mockResolvedValue(mockOffer),
+    } as unknown as LocalCoinSwapClient;
+
+    config = {
+      apiToken: 'test-token',
+      apiUrl: 'https://api.test.com',
+      requireConfirmation: false,
+    };
+
+    clearPendingConfirmations();
+  });
+
+  describe('Currency symbol validation', () => {
+    it('should reject invalid currency symbol (too short)', async () => {
+      const result = await handleGetCurrency(mockClient, { symbol: 'X' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid currency symbol');
+    });
+
+    it('should reject invalid currency symbol (too long)', async () => {
+      const result = await handleGetCurrency(mockClient, { symbol: 'VERYLONGCURRENCY' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid currency symbol');
+    });
+
+    it('should reject invalid currency symbol (special chars)', async () => {
+      const result = await handleGetCurrency(mockClient, { symbol: 'BT@C' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid currency symbol');
+    });
+
+    it('should accept valid currency symbols', async () => {
+      const result = await handleGetCurrency(mockClient, { symbol: 'USDT' });
+      expect(result.isError).toBeUndefined();
+    });
+  });
+
+  describe('Amount validation', () => {
+    it('should reject negative amounts', async () => {
+      const result = await handleEstimateSwap(mockClient, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        amount: '-1.0',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid amount');
+    });
+
+    it('should reject zero amounts', async () => {
+      const result = await handleEstimateSwap(mockClient, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        amount: '0',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid amount');
+    });
+
+    it('should reject non-numeric amounts', async () => {
+      const result = await handleEstimateSwap(mockClient, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        amount: 'abc',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid amount');
+    });
+
+    it('should accept valid amounts', async () => {
+      const result = await handleEstimateSwap(mockClient, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        amount: '1.5',
+      });
+      expect(result.isError).toBeUndefined();
+    });
+
+    it('should accept integer amounts', async () => {
+      const result = await handleEstimateSwap(mockClient, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        amount: '100',
+      });
+      expect(result.isError).toBeUndefined();
+    });
+  });
+
+  describe('Search offers validation', () => {
+    it('should reject invalid coin_currency', async () => {
+      const result = await handleSearchOffers(mockClient, {
+        coin_currency: '@invalid',
+      });
+      expect(result.isError).toBe(true);
+    });
+
+    it('should reject negative min_amount', async () => {
+      const result = await handleSearchOffers(mockClient, {
+        min_amount: -100,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('min_amount must be non-negative');
+    });
+
+    it('should reject negative max_amount', async () => {
+      const result = await handleSearchOffers(mockClient, {
+        max_amount: -100,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('max_amount must be non-negative');
+    });
+  });
+
+  describe('Create swap validation', () => {
+    it('should validate all swap parameters', async () => {
+      const result = await handleCreateSwap(mockClient, config, {
+        from_currency: '@',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+      });
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe('Start trade validation', () => {
+    it('should validate amount parameter', async () => {
+      const result = await handleStartTrade(mockClient, config, {
+        offer_uuid: 'offer-123',
+        amount: '-500',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid amount');
+    });
+  });
+});
+
 describe('Confirmation System', () => {
   let mockClient: LocalCoinSwapClient;
   let config: ServerConfig;
@@ -305,6 +454,7 @@ describe('Confirmation System', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     clearPendingConfirmations();
+    stopConfirmationCleanup();
   });
 
   describe('handleCreateSwap confirmation', () => {
@@ -335,7 +485,20 @@ describe('Confirmation System', () => {
       expect(mockClient.createSwap).toHaveBeenCalled();
     });
 
-    it('should execute swap with valid confirmation_id', async () => {
+    it('should require confirmation when confirm is explicitly false', async () => {
+      const result = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+        confirm: false,
+      });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.status).toBe('confirmation_required');
+      expect(mockClient.createSwap).not.toHaveBeenCalled();
+    });
+
+    it('should execute swap with valid confirmation_id and matching params', async () => {
       // First call to get confirmation ID
       const firstResult = await handleCreateSwap(mockClient, config, {
         from_currency: 'ETH',
@@ -345,7 +508,7 @@ describe('Confirmation System', () => {
 
       const { confirmation_id } = JSON.parse(firstResult.content[0].text);
 
-      // Second call with confirmation ID
+      // Second call with confirmation ID and SAME params
       const secondResult = await handleCreateSwap(mockClient, config, {
         from_currency: 'ETH',
         to_currency: 'USDT',
@@ -356,6 +519,67 @@ describe('Confirmation System', () => {
       const parsed = JSON.parse(secondResult.content[0].text);
       expect(parsed.status).toBe('swap_created');
       expect(mockClient.createSwap).toHaveBeenCalled();
+    });
+
+    it('should reject confirmation_id with changed from_currency', async () => {
+      const firstResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+      });
+
+      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
+
+      // Try with different from_currency
+      const secondResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'BTC', // CHANGED
+        to_currency: 'USDT',
+        from_amount: '1.0',
+        confirmation_id,
+      });
+
+      expect(secondResult.isError).toBe(true);
+      expect(secondResult.content[0].text).toContain('parameters do not match');
+    });
+
+    it('should reject confirmation_id with changed to_currency', async () => {
+      const firstResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+      });
+
+      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
+
+      const secondResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'BTC', // CHANGED
+        from_amount: '1.0',
+        confirmation_id,
+      });
+
+      expect(secondResult.isError).toBe(true);
+      expect(secondResult.content[0].text).toContain('parameters do not match');
+    });
+
+    it('should reject confirmation_id with changed amount', async () => {
+      const firstResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+      });
+
+      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
+
+      const secondResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '999.0', // CHANGED
+        confirmation_id,
+      });
+
+      expect(secondResult.isError).toBe(true);
+      expect(secondResult.content[0].text).toContain('parameters do not match');
     });
 
     it('should reject invalid confirmation_id', async () => {
@@ -421,6 +645,63 @@ describe('Confirmation System', () => {
       expect(mockClient.startTrade).toHaveBeenCalled();
     });
 
+    it('should reject confirmation_id with changed offer_uuid', async () => {
+      const firstResult = await handleStartTrade(mockClient, config, {
+        offer_uuid: 'offer-uuid-456',
+        amount: '500',
+      });
+
+      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
+
+      const secondResult = await handleStartTrade(mockClient, config, {
+        offer_uuid: 'different-offer', // CHANGED
+        amount: '500',
+        confirmation_id,
+      });
+
+      expect(secondResult.isError).toBe(true);
+      expect(secondResult.content[0].text).toContain('parameters do not match');
+    });
+
+    it('should reject confirmation_id with changed amount', async () => {
+      const firstResult = await handleStartTrade(mockClient, config, {
+        offer_uuid: 'offer-uuid-456',
+        amount: '500',
+      });
+
+      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
+
+      const secondResult = await handleStartTrade(mockClient, config, {
+        offer_uuid: 'offer-uuid-456',
+        amount: '9999', // CHANGED
+        confirmation_id,
+      });
+
+      expect(secondResult.isError).toBe(true);
+      expect(secondResult.content[0].text).toContain('parameters do not match');
+    });
+
+    it('should reject swap confirmation_id for trade action', async () => {
+      // Get a swap confirmation ID
+      const swapResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+      });
+
+      const { confirmation_id } = JSON.parse(swapResult.content[0].text);
+
+      // Try to use it for a trade
+      const tradeResult = await handleStartTrade(mockClient, config, {
+        offer_uuid: 'offer-uuid-456',
+        amount: '500',
+        confirmation_id,
+      });
+
+      expect(tradeResult.isError).toBe(true);
+      expect(tradeResult.content[0].text).toContain('different action');
+    });
+
     it('should skip confirmation when requireConfirmation is false', async () => {
       const noConfirmConfig = { ...config, requireConfirmation: false };
       const result = await handleStartTrade(mockClient, noConfirmConfig, {
@@ -446,35 +727,6 @@ describe('Confirmation System', () => {
 
   describe('Confirmation expiration', () => {
     it('should reject expired confirmation IDs', async () => {
-      // First call to get confirmation ID
-      const firstResult = await handleCreateSwap(mockClient, config, {
-        from_currency: 'ETH',
-        to_currency: 'USDT',
-        from_amount: '1.0',
-      });
-
-      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
-
-      // Manually expire the confirmation
-      const pending = getPendingConfirmation(confirmation_id);
-      if (pending) {
-        pending.expiresAt = Date.now() - 1000; // Set to past
-      }
-
-      // Try to use expired confirmation
-      const secondResult = await handleCreateSwap(mockClient, config, {
-        from_currency: 'ETH',
-        to_currency: 'USDT',
-        from_amount: '1.0',
-        confirmation_id,
-      });
-
-      expect(secondResult.isError).toBe(true);
-      expect(secondResult.content[0].text).toContain('expired');
-    });
-
-    it('should cleanup expired confirmations', async () => {
-      // First call to get confirmation ID
       const firstResult = await handleCreateSwap(mockClient, config, {
         from_currency: 'ETH',
         to_currency: 'USDT',
@@ -489,7 +741,31 @@ describe('Confirmation System', () => {
         pending.expiresAt = Date.now() - 1000;
       }
 
-      // Try to use expired confirmation
+      const secondResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+        confirmation_id,
+      });
+
+      expect(secondResult.isError).toBe(true);
+      expect(secondResult.content[0].text).toContain('expired');
+    });
+
+    it('should cleanup expired confirmations on use', async () => {
+      const firstResult = await handleCreateSwap(mockClient, config, {
+        from_currency: 'ETH',
+        to_currency: 'USDT',
+        from_amount: '1.0',
+      });
+
+      const { confirmation_id } = JSON.parse(firstResult.content[0].text);
+
+      const pending = getPendingConfirmation(confirmation_id);
+      if (pending) {
+        pending.expiresAt = Date.now() - 1000;
+      }
+
       await handleCreateSwap(mockClient, config, {
         from_currency: 'ETH',
         to_currency: 'USDT',
@@ -497,8 +773,21 @@ describe('Confirmation System', () => {
         confirmation_id,
       });
 
-      // Confirmation should be deleted
       expect(getPendingConfirmation(confirmation_id)).toBeUndefined();
+    });
+  });
+
+  describe('Cleanup functions', () => {
+    it('startConfirmationCleanup and stopConfirmationCleanup should work', () => {
+      // Should not throw
+      startConfirmationCleanup(1000);
+      stopConfirmationCleanup();
+    });
+
+    it('startConfirmationCleanup should replace existing interval', () => {
+      startConfirmationCleanup(1000);
+      startConfirmationCleanup(2000); // Should replace, not add
+      stopConfirmationCleanup();
     });
   });
 });
